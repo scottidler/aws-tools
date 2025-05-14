@@ -1,0 +1,25 @@
+[package]
+name = "ls-vpc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { workspace = true }
+eyre = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+aws-config = "1.6.2"
+aws-sdk-rds = "1.86.0"
+aws-sdk-sts = "1.68.0"
+aws-sdk-organizations = "1.75.0"
+aws-sdk-ec2 = "1.129.0"
+aws-sdk-elasticloadbalancingv2 = "1.76.0"
+aws-sdk-eks = "1.86.0"
+aws-sdk-docdb = "1.71.0"
+aws-sdk-elasticache = "1.73.0"
+aws-sdk-autoscaling = "1.75.0"
+aws-sdk-lambda = "1.78.0"
+aws-types = "1.3.7"
+futures = "0.3.31"
+tokio = { version = "1.45.0", features = ["full"] }
+async-trait = "0.1.88"

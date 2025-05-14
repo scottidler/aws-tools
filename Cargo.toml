@@ -1,6 +1,6 @@
 [workspace]
 members = [
-  "ls-rds",
+  "ls-rds", "ls-vpc",
 ]
 
 resolver = "2"
