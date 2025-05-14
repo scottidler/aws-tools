@@ -1,18 +1,13 @@
-//! ls-vpc v0.2
+//! ls-vpc v0.3.3
 //! ---------------------------------------------------------------------------
-//!   • Lists every AWS resource that lives in the VPC you specify
-//!   • Classifies that VPC per-Region as “public” (has an IGW) and/or “peered”
-//!   • Implemented resource scanners
-//!       – EC2: instances, ENIs, NAT Gateways, VPC Flow Logs
-//!       – ELBv2: load balancers & target groups
-//!       – RDS/Aurora: instances & clusters
-//!       – DocumentDB clusters
-//!
-//! Usage example
-//!   aws-vault exec prod -- ./target/release/ls-vpc \
-//!       --vpc-id vpc-0abc123def456 \
-//!       --regions us-west-2,us-east-1
+//! • Scan one or many VPCs in the Regions you list (`--regions` is required).
+//! • If you pass no VPC IDs (positional), every VPC in those Regions is scanned.
+//! • Prints whether each VPC is public (IGW attached) and/or peered.
+//! • Writes full TRACE logs to:
+//!       macOS   ~/Library/Logs/slam/ls-vpc.log
+//!       Linux   ~/.local/state/slam/ls-vpc/ls-vpc.log   (or  $XDG_STATE_HOME)
 
+// std ───────────────────────────────────────────────────────────────
 use std::{
     env,
     fs::{self, OpenOptions},
@@ -21,82 +16,72 @@ use std::{
     time::Instant,
 };
 
+// deps ──────────────────────────────────────────────────────────────
 use async_trait::async_trait;
-use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
+use aws_config::BehaviorVersion;
 use aws_sdk_docdb as docdb;
 use aws_sdk_ec2 as ec2;
 use aws_sdk_elasticloadbalancingv2 as elbv2;
 use aws_sdk_rds as rds;
 use aws_types::{region::Region, SdkConfig};
-use clap::Parser;
-use eyre::Result;
-use futures::{stream, StreamExt};
+use clap::{Parser, ValueHint};
+use eyre::{eyre, Result};
 use log::{error, info, trace};
+use env_logger::Target;
 
-/*──────────────────────── data models ───────────────────────*/
+/*──────────────────────── data structures ─────────────────────────*/
 
 #[derive(Debug)]
 struct ResourceRecord {
-    arn:    String,
-    rtype:  &'static str,
-    name:   String,
-    region: String,
+    arn: String,
+    rtype: &'static str,
+    name: String,
 }
 
 #[derive(Debug)]
-struct VpcClass {
-    region: String,
+struct VpcSummary {
+    name: Option<String>,
     public: bool,
     peered: bool,
+    resources: Vec<ResourceRecord>,
 }
 
-/*──────────────────────── CLI options ──────────────────────*/
+/*──────────────────────── CLI definition ──────────────────────────*/
 
 #[derive(Parser, Debug)]
 #[command(name = "ls-vpc", author, version, about)]
 struct Opt {
-    /// VPC ID like vpc-0123abcd
-    #[clap(long, required = true)]
-    vpc_id: String,
-
-    /// Regions list, space- or comma-separated
+    /// Comma- or space-separated list of Regions (required)
     #[clap(
         long,
         value_delimiter = ',',
         num_args = 1..,
-        default_values = ["us-east-1", "us-west-2"]
+        value_hint = ValueHint::Other
     )]
     regions: Vec<String>,
+
+    /// Zero or more VPC IDs.  If none given, all VPCs are scanned.
+    #[clap(value_name = "VPC_ID", value_hint = ValueHint::Other)]
+    vpc_ids: Vec<String>,
 }
 
-/*────────────────── generic scanner trait ──────────────────*/
+/*──────────────────────── scanner trait ───────────────────────────*/
 
 #[async_trait]
 trait ServiceScanner: Send + Sync {
-    async fn scan(
-        &self,
-        sdk: &SdkConfig,
-        region: &Region,
-        vpc_id: &str,
-    ) -> Result<Vec<ResourceRecord>>;
+    async fn scan(&self, sdk: &SdkConfig, vpc_id: &str) -> Result<Vec<ResourceRecord>>;
 }
 
-/*────────────────── EC2-family scanner ─────────────────────*/
+/*──────────────────────── EC2 scanner ─────────────────────────────*/
 
 struct Ec2Scanner;
-
 #[async_trait]
 impl ServiceScanner for Ec2Scanner {
-    async fn scan(
-        &self,
-        sdk: &SdkConfig,
-        region: &Region,
-        vpc_id: &str,
-    ) -> Result<Vec<ResourceRecord>> {
+    async fn scan(&self, sdk: &SdkConfig, vpc_id: &str) -> Result<Vec<ResourceRecord>> {
         let client = ec2::Client::new(sdk);
         let mut recs = Vec::new();
 
-        /* instances */
+        // Instances
         let mut pages = client
             .describe_instances()
             .filters(
@@ -111,11 +96,7 @@ impl ServiceScanner for Ec2Scanner {
         while let Some(res) = pages.next().await {
             for inst in res?.instances() {
                 recs.push(ResourceRecord {
-                    arn: format!(
-                        "arn:aws:ec2:{}::instance/{}",
-                        region.as_ref(),
-                        inst.instance_id().unwrap_or_default()
-                    ),
+                    arn: inst.instance_id().unwrap_or_default().to_owned(),
                     rtype: "ec2.instance",
                     name: inst
                         .tags()
@@ -124,13 +105,12 @@ impl ServiceScanner for Ec2Scanner {
                         .and_then(|t| t.value())
                         .unwrap_or_default()
                         .to_owned(),
-                    region: region.as_ref().into(),
                 });
             }
         }
 
-        /* ENIs */
-        let enis = client
+        // ENIs
+        for eni in client
             .describe_network_interfaces()
             .filters(
                 ec2::types::Filter::builder()
@@ -139,22 +119,18 @@ impl ServiceScanner for Ec2Scanner {
                     .build(),
             )
             .send()
-            .await?;
-        for eni in enis.network_interfaces() {
+            .await?
+            .network_interfaces()
+        {
             recs.push(ResourceRecord {
-                arn: format!(
-                    "arn:aws:ec2:{}::network-interface/{}",
-                    region.as_ref(),
-                    eni.network_interface_id().unwrap_or_default()
-                ),
+                arn: eni.network_interface_id().unwrap_or_default().to_owned(),
                 rtype: "ec2.eni",
                 name: eni.description().unwrap_or_default().to_owned(),
-                region: region.as_ref().into(),
             });
         }
 
-        /* NAT Gateways */
-        let nat_gws = client
+        // NAT Gateways
+        for ngw in client
             .describe_nat_gateways()
             .filter(
                 ec2::types::Filter::builder()
@@ -163,22 +139,18 @@ impl ServiceScanner for Ec2Scanner {
                     .build(),
             )
             .send()
-            .await?;
-        for ngw in nat_gws.nat_gateways() {
+            .await?
+            .nat_gateways()
+        {
             recs.push(ResourceRecord {
-                arn: format!(
-                    "arn:aws:ec2:{}::natgateway/{}",
-                    region.as_ref(),
-                    ngw.nat_gateway_id().unwrap_or_default()
-                ),
+                arn: ngw.nat_gateway_id().unwrap_or_default().to_owned(),
                 rtype: "ec2.nat-gateway",
                 name: ngw.nat_gateway_id().unwrap_or_default().to_owned(),
-                region: region.as_ref().into(),
             });
         }
 
-        /* VPC Flow Logs */
-        let flow_logs = client
+        // Flow Logs
+        for fl in client
             .describe_flow_logs()
             .filter(
                 ec2::types::Filter::builder()
@@ -187,13 +159,13 @@ impl ServiceScanner for Ec2Scanner {
                     .build(),
             )
             .send()
-            .await?;
-        for fl in flow_logs.flow_logs() {
+            .await?
+            .flow_logs()
+        {
             recs.push(ResourceRecord {
                 arn: fl.flow_log_id().unwrap_or_default().to_owned(),
                 rtype: "ec2.flow-log",
                 name: fl.log_group_name().unwrap_or_default().to_owned(),
-                region: region.as_ref().into(),
             });
         }
 
@@ -201,18 +173,12 @@ impl ServiceScanner for Ec2Scanner {
     }
 }
 
-/*────────────────── ELBv2 scanner ─────────────────────────*/
+/*──────────────────────── ELBv2 scanner ───────────────────────────*/
 
 struct ElbScanner;
-
 #[async_trait]
 impl ServiceScanner for ElbScanner {
-    async fn scan(
-        &self,
-        sdk: &SdkConfig,
-        region: &Region,
-        vpc_id: &str,
-    ) -> Result<Vec<ResourceRecord>> {
+    async fn scan(&self, sdk: &SdkConfig, vpc_id: &str) -> Result<Vec<ResourceRecord>> {
         let client = elbv2::Client::new(sdk);
         let mut recs = Vec::new();
 
@@ -222,7 +188,6 @@ impl ServiceScanner for ElbScanner {
                     arn: lb.load_balancer_arn().unwrap_or_default().to_owned(),
                     rtype: "elbv2.load-balancer",
                     name: lb.load_balancer_name().unwrap_or_default().to_owned(),
-                    region: region.as_ref().into(),
                 });
             }
         }
@@ -233,7 +198,6 @@ impl ServiceScanner for ElbScanner {
                     arn: tg.target_group_arn().unwrap_or_default().to_owned(),
                     rtype: "elbv2.target-group",
                     name: tg.target_group_name().unwrap_or_default().to_owned(),
-                    region: region.as_ref().into(),
                 });
             }
         }
@@ -241,22 +205,15 @@ impl ServiceScanner for ElbScanner {
     }
 }
 
-/*────────────── RDS / Aurora / DocDB scanner ──────────────*/
+/*────────────────── RDS / DocDB scanner ──────────────────────────*/
 
 struct RdsScanner;
-
 #[async_trait]
 impl ServiceScanner for RdsScanner {
-    async fn scan(
-        &self,
-        sdk: &SdkConfig,
-        region: &Region,
-        vpc_id: &str,
-    ) -> Result<Vec<ResourceRecord>> {
+    async fn scan(&self, sdk: &SdkConfig, vpc_id: &str) -> Result<Vec<ResourceRecord>> {
         let client = rds::Client::new(sdk);
         let mut recs = Vec::new();
 
-        /* RDS instances */
         for db in client.describe_db_instances().send().await?.db_instances() {
             if db
                 .db_subnet_group()
@@ -267,41 +224,60 @@ impl ServiceScanner for RdsScanner {
                     arn: db.db_instance_arn().unwrap_or_default().to_owned(),
                     rtype: "rds.instance",
                     name: db.db_instance_identifier().unwrap_or_default().to_owned(),
-                    region: region.as_ref().into(),
                 });
             }
         }
 
-        /* RDS/Aurora clusters (no direct VPC field in SDK) */
         for cl in client.describe_db_clusters().send().await?.db_clusters() {
             recs.push(ResourceRecord {
                 arn: cl.db_cluster_arn().unwrap_or_default().to_owned(),
                 rtype: "rds.cluster",
                 name: cl.db_cluster_identifier().unwrap_or_default().to_owned(),
-                region: region.as_ref().into(),
             });
         }
 
-        /* DocumentDB clusters */
         let dclient = docdb::Client::new(sdk);
         for cl in dclient.describe_db_clusters().send().await?.db_clusters() {
             recs.push(ResourceRecord {
                 arn: cl.db_cluster_arn().unwrap_or_default().to_owned(),
                 rtype: "docdb.cluster",
                 name: cl.db_cluster_identifier().unwrap_or_default().to_owned(),
-                region: region.as_ref().into(),
             });
         }
         Ok(recs)
     }
 }
 
-/*────────────────── classify VPC helper ───────────────────*/
+/*────────────────── VPC helpers ──────────────────────────*/
 
-async fn classify_vpc(conf: &SdkConfig, region: &Region, vpc_id: &str) -> Result<VpcClass> {
+async fn discover_vpcs(
+    conf: &SdkConfig,
+    filter_ids: &[String],
+) -> Result<Vec<(String, Option<String>)>> {
+    let client = ec2::Client::new(conf);
+    let mut req = client.describe_vpcs();
+    for id in filter_ids {
+        req = req.vpc_ids(id);
+    }
+    let resp = req.send().await?;
+    Ok(resp
+        .vpcs()
+        .iter()
+        .map(|v| {
+            let name = v
+                .tags()
+                .iter()
+                .find(|t| t.key() == Some("Name"))
+                .and_then(|t| t.value())
+                .map(|s| s.to_owned());
+            (v.vpc_id().unwrap_or_default().to_owned(), name)
+        })
+        .collect())
+}
+
+async fn classify_vpc(conf: &SdkConfig, vpc_id: &str) -> Result<(bool, bool)> {
     let ec2c = ec2::Client::new(conf);
 
-    /* public? — any IGW attached */
     let public = !ec2c
         .describe_internet_gateways()
         .filters(
@@ -315,7 +291,6 @@ async fn classify_vpc(conf: &SdkConfig, region: &Region, vpc_id: &str) -> Result
         .internet_gateways()
         .is_empty();
 
-    /* peered? — any ACTIVE VPC peering connection */
     let peered = ec2c
         .describe_vpc_peering_connections()
         .filters(
@@ -330,161 +305,132 @@ async fn classify_vpc(conf: &SdkConfig, region: &Region, vpc_id: &str) -> Result
         .iter()
         .any(|pc| {
             matches!(
-                pc.status()
-                    .and_then(|s| s.code()),
+                pc.status().and_then(|s| s.code()),
                 Some(ec2::types::VpcPeeringConnectionStateReasonCode::Active)
             )
         });
 
-    Ok(VpcClass {
-        region: region.as_ref().into(),
-        public,
-        peered,
-    })
+    Ok((public, peered))
 }
 
 /*────────────────────────── main ──────────────────────────*/
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    /* logging setup */
-    let log_dir = get_or_create_log_dir();
-    let log_path = log_dir.join("ls-vpc.log");
-    let fh = OpenOptions::new().create(true).append(true).open(&log_path)?;
+    /* ───── CLI and logging ───── */
+    let opt = Opt::parse();
+    if opt.regions.is_empty() {
+        return Err(eyre!("--regions is required"));
+    }
+
+    let log_file = get_or_create_log_dir().join("ls-vpc.log");
+    let fh = OpenOptions::new().create(true).append(true).open(&log_file)?;
     env_logger::Builder::from_default_env()
         .format(|buf, rec| {
             let ts = buf.timestamp_millis();
-            writeln!(buf, "{} {:<5} [{}] {}", ts, rec.level(), rec.target(), rec.args())
+            writeln!(
+                buf,
+                "{} {:<5} [{:<15}] {}",
+                ts,
+                rec.level(),
+                rec.target(),
+                rec.args()
+            )
         })
-        .target(env_logger::Target::Pipe(Box::new(fh)))
+        .target(Target::Pipe(Box::new(fh)))
         .filter_level(log::LevelFilter::Trace)
         .init();
-    info!("Logs → {}", log_path.display());
+    info!("Logging to {}", log_file.display());
 
-    /* CLI + bootstrap config */
-    let opt = Opt::parse();
-    info!("VPC   : {}", opt.vpc_id);
-    info!("Regions: {:?}", opt.regions);
+    /* ───── scanner registry ───── */
+    let scanners: Vec<Box<dyn ServiceScanner>> =
+        vec![Box::new(Ec2Scanner), Box::new(ElbScanner), Box::new(RdsScanner)];
 
-    let bootstrap_region = &opt.regions[0];
-    let base_conf = aws_config::defaults(BehaviorVersion::latest())
-        .region(Region::new(bootstrap_region.clone()))
-        .load()
-        .await;
-
-    let regions: Vec<Region> = opt
-        .regions
-        .iter()
-        .map(|s| Region::new(s.clone()))
-        .collect();
-
-    let registry: Vec<(&str, Box<dyn ServiceScanner>)> = vec![
-        ("ec2", Box::new(Ec2Scanner)),
-        ("elbv2", Box::new(ElbScanner)),
-        ("rds", Box::new(RdsScanner)),
-    ];
-
-    /* scan + classify */
+    let mut vpcs: std::collections::BTreeMap<(String, String), VpcSummary> = Default::default();
     let start = Instant::now();
-    let mut classes: Vec<VpcClass> = Vec::new();
-    let mut all_recs: Vec<ResourceRecord> = Vec::new();
 
-    for region in &regions {
-        info!("--- {}", region.as_ref());
-
-        /* per-region SDK config reusing creds */
+    for region_name in &opt.regions {
+        info!("Region {}", region_name);
+        let region = Region::new(region_name.clone());
         let conf = aws_config::defaults(BehaviorVersion::latest())
-            .region(RegionProviderChain::first_try(region.clone()))
-            .credentials_provider(base_conf.credentials_provider().unwrap().clone())
+            .region(region.clone())
             .load()
             .await;
 
-        /* classify */
-        match classify_vpc(&conf, region, &opt.vpc_id).await {
-            Ok(cls) => classes.push(cls),
-            Err(e) => error!("classification error {}: {:?}", region.as_ref(), e),
-        }
+        // discover vpcs
+        let discovered = discover_vpcs(&conf, &opt.vpc_ids).await?;
+        trace!("found {} VPCs", discovered.len());
 
-        /* scanners */
-        let tasks = registry.iter().map(|(name, scanner)| {
-            let vpc_id = opt.vpc_id.clone();
-            let region = region.clone();
-            let conf = conf.clone();
-            let name = *name;
-            async move {
-                trace!("{name} scanner start {}", region.as_ref());
-                scanner.scan(&conf, &region, &vpc_id).await.map_err(|e| {
-                    error!("{name} error in {}: {:?}", region.as_ref(), e);
-                    e
-                })
+        for (vpc_id, vpc_name) in discovered {
+            let (public, peered) = classify_vpc(&conf, &vpc_id).await?;
+            trace!("{} {} public={} peered={}", region_name, vpc_id, public, peered);
+
+            let mut summary = VpcSummary {
+                name: vpc_name,
+                public,
+                peered,
+                resources: Vec::new(),
+            };
+
+            for s in &scanners {
+                match s.scan(&conf, &vpc_id).await {
+                    Ok(mut r) => summary.resources.append(&mut r),
+                    Err(e) => error!("scan error {} {}: {:?}", region_name, vpc_id, e),
+                }
             }
-        });
 
-        for mut vecs in stream::iter(tasks)
-            .buffer_unordered(6)
-            .filter_map(|r| async { r.ok() })
-            .collect::<Vec<_>>()
-            .await
-        {
-            all_recs.append(&mut vecs);
+            vpcs.insert((region_name.clone(), vpc_id), summary);
         }
     }
 
-    /* output */
-    info!("Finished in {:.2?}", start.elapsed());
+    /* ───── output ───── */
+    println!(
+        "{:<10} {:<15} {:<25} {:<10} {:<6}",
+        "REGION", "VPC-ID", "NAME", "VISIBILITY", "PEERED"
+    );
+    println!("{}", "-".repeat(95));
 
-    println!("\nVPC CLASSIFICATION");
-    println!("{:<10} {:<6} {:<6}", "REGION", "PUBLIC", "PEERED");
-    for cls in &classes {
+    for ((region, vpc_id), summary) in &vpcs {
         println!(
-            "{:<10} {:<6} {:<6}",
-            cls.region,
-            if cls.public { "yes" } else { "no" },
-            if cls.peered { "yes" } else { "no" }
+            "{:<10} {:<15} {:<25} {:<10} {:<6}",
+            region,
+            vpc_id,
+            summary.name.as_deref().unwrap_or(""),
+            if summary.public { "public" } else { "private" },
+            if summary.peered { "true" } else { "false" }
         );
+        for r in &summary.resources {
+            println!("  {:<22} {:<28} {}", r.rtype, r.name, r.arn);
+        }
+        println!();
     }
 
     println!(
-        "\n{:<10} {:<22} {:<28} {}",
-        "REGION", "TYPE", "NAME", "ARN"
+        "Scanned {} VPC(s) across {} Region(s) in {:.2?}",
+        vpcs.len(),
+        opt.regions.len(),
+        start.elapsed()
     );
-    println!("{}", "-".repeat(100));
-    for rec in &all_recs {
-        println!(
-            "{:<10} {:<22} {:<28} {}",
-            rec.region, rec.rtype, rec.name, rec.arn
-        );
-    }
-    println!("Total resources: {}", all_recs.len());
     Ok(())
 }
 
-/*──────────────── helper: log directory ─────────────────*/
+/*──────────── log directory helper ───────────*/
 
 fn get_or_create_log_dir() -> PathBuf {
-    let dir = {
-        #[cfg(target_os = "macos")]
-        {
-            env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("Library")
-                .join("Logs")
-                .join("slam")
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            if let Ok(x) = env::var("XDG_STATE_HOME") {
-                PathBuf::from(x).join("slam")
-            } else if let Ok(h) = env::var("HOME") {
-                PathBuf::from(h).join(".local").join("state").join("slam")
-            } else {
-                PathBuf::from("slam_logs")
-            }
-        }
+    let dir = if cfg!(target_os = "macos") {
+        env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("Library")
+            .join("Logs")
+            .join("slam")
+    } else if let Ok(x) = env::var("XDG_STATE_HOME") {
+        PathBuf::from(x).join("slam")
+    } else if let Ok(h) = env::var("HOME") {
+        PathBuf::from(h).join(".local").join("state").join("slam")
+    } else {
+        PathBuf::from("slam_logs")
     };
-    fs::create_dir_all(&dir).unwrap_or_else(|e| {
-        eprintln!("‼️  could not create {}: {}", dir.display(), e);
-    });
+    fs::create_dir_all(&dir).ok();
     dir
 }
