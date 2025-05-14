@@ -1,9 +1,10 @@
 // src/main.rs
 
-//! List every RDS DB instance in the current account (and, optionally, across
-//! other accounts or explicit role ARNs). All log output is written to a file
-//! whose location is chosen by `get_or_create_log_dir()`; nothing is printed to
-//! the terminal unless you explicitly `tail -f` the file.
+//! List every RDS DB instance in the current account (and optionally across
+//! other accounts or explicit role ARNs).  All log output is written to a
+//! timestamped file under an OS‑appropriate “slam” log directory.  The
+//! `--regions` flag now accepts *multiple* values—either as separate CLI
+//! arguments *or* as a single comma‑separated string.
 
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_config::sts::AssumeRoleProvider;
@@ -32,14 +33,22 @@ struct Opt {
     #[clap(long, conflicts_with = "use_org")]
     role_arns: Vec<String>,
 
-    /// Comma‑separated AWS Regions to scan
-    #[clap(long, default_value = "us-east-1,us-west-2")]
-    regions: String,
+    /// One or more AWS Regions to scan.  You may supply them as
+    ///   --regions us-west-2 us-east-1
+    /// or as a single comma‑separated string:
+    ///   --regions us-west-2,us-east-1
+    #[clap(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        default_values = ["us-east-1", "us-west-2"]
+    )]
+    regions: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ───────────── setup file logging ─────────────
+    // ────────── set up file logging ──────────
     let log_dir = get_or_create_log_dir();
     let log_file_path = log_dir.join("ls-rds.log");
     let log_file = OpenOptions::new()
@@ -61,39 +70,31 @@ async fn main() -> Result<()> {
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .filter_level(log::LevelFilter::Trace)
         .init();
-
     info!("Logging to {}", log_file_path.display());
 
     let overall_start = Instant::now();
     let opt = Opt::parse();
-    debug!("CLI options parsed: {:?}", opt);
+    debug!("CLI options: {:?}", opt);
 
-    // ───── choose a bootstrap Region ─────
+    // ───────── choose a bootstrap Region ─────────
     let default_region = env::var("AWS_REGION")
         .or_else(|_| env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| {
-            opt.regions
-                .split(',')
-                .next()
-                .unwrap_or("us-east-1")
-                .trim()
-                .to_owned()
-        });
-    debug!("Default Region for bootstrap/STSes: {}", default_region);
+        .unwrap_or_else(|_| opt.regions[0].clone());
+    debug!("Bootstrap/STSes Region: {}", &default_region);
 
-    // ───── build base config ─────
+    // ───────── build base config ─────────
     info!("Loading base AWS config…");
     let base_conf = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(default_region.clone()))
         .load()
         .await;
     debug!(
-        "Loaded base config in {:.2?} (Region = {:?})",
+        "Loaded base config in {:.2?}  (Region = {:?})",
         overall_start.elapsed(),
         base_conf.region().map(|r| r.as_ref())
     );
 
-    // ───── figure out current account ─────
+    // ───────── identify current account ─────────
     debug!("Calling STS GetCallerIdentity…");
     let caller_account = sts::Client::new(&base_conf)
         .get_caller_identity()
@@ -104,15 +105,18 @@ async fn main() -> Result<()> {
         .to_owned();
     debug!("Caller account = {}", caller_account);
 
-    // ───── parse Regions argument ─────
+    // ───────── convert regions to aws_types::Region ─────────
     let regions: Vec<Region> = opt
         .regions
-        .split(',')
-        .map(|s| Region::new(s.trim().to_owned()))
+        .iter()
+        .map(|s| {
+            debug!("Parsed Region arg: {}", s);
+            Region::new(s.trim().to_owned())
+        })
         .collect();
-    debug!("Regions to scan: {:?}", regions);
+    debug!("Regions vector = {:?}", regions);
 
-    // ───── choose execution path ─────
+    // ───────── run primary logic ─────────
     if opt.use_org {
         enumerate_organization(&base_conf, &regions).await?;
     } else if !opt.role_arns.is_empty() {
