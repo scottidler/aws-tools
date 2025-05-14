@@ -1,8 +1,9 @@
 // src/main.rs
 
-//! List every RDS DB instance in the current account (and, optionally, in other
-//! accounts/roles).  Uses very chatty logging so you can see *every* decision
-//! and AWS call that happens.
+//! List every RDS DB instance in the current account (and, optionally, across
+//! other accounts or explicit role ARNs). All log output is written to a file
+//! whose location is chosen by `get_or_create_log_dir()`; nothing is printed to
+//! the terminal unless you explicitly `tail -f` the file.
 
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_config::sts::AssumeRoleProvider;
@@ -13,7 +14,13 @@ use aws_types::{region::Region, SdkConfig};
 use clap::Parser;
 use eyre::Result;
 use log::{debug, error, info};
-use std::{env, time::Instant};
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::PathBuf,
+    time::Instant,
+};
 
 #[derive(Parser, Debug)]
 struct Opt {
@@ -32,16 +39,36 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ─────────────── logger ───────────────
+    // ───────────── setup file logging ─────────────
+    let log_dir = get_or_create_log_dir();
+    let log_file_path = log_dir.join("ls-rds.log");
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)?;
     env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Trace) // show EVERYthing
+        .format(|buf, record| {
+            let ts = buf.timestamp_millis();
+            writeln!(
+                buf,
+                "{} {:<5} [{}] {}",
+                ts,
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .filter_level(log::LevelFilter::Trace)
         .init();
+
+    info!("Logging to {}", log_file_path.display());
 
     let overall_start = Instant::now();
     let opt = Opt::parse();
     debug!("CLI options parsed: {:?}", opt);
 
-    // ─────── determine a default Region for STS/bootstrap ──────
+    // ───── choose a bootstrap Region ─────
     let default_region = env::var("AWS_REGION")
         .or_else(|_| env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|_| {
@@ -52,23 +79,22 @@ async fn main() -> Result<()> {
                 .trim()
                 .to_owned()
         });
-    debug!("Chosen default Region for bootstrap/STSes: {}", default_region);
+    debug!("Default Region for bootstrap/STSes: {}", default_region);
 
-    // ─────────── base config (with a Region) ───────────
+    // ───── build base config ─────
     info!("Loading base AWS config…");
     let base_conf = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(default_region.clone()))
         .load()
         .await;
     debug!(
-        "Loaded base config in {:.2?}  (Region = {:?})",
+        "Loaded base config in {:.2?} (Region = {:?})",
         overall_start.elapsed(),
         base_conf.region().map(|r| r.as_ref())
     );
 
-    // ─── discover which account these credentials belong to ───
+    // ───── figure out current account ─────
     debug!("Calling STS GetCallerIdentity…");
-    let caller_identity_start = Instant::now();
     let caller_account = sts::Client::new(&base_conf)
         .get_caller_identity()
         .send()
@@ -76,34 +102,23 @@ async fn main() -> Result<()> {
         .account()
         .unwrap_or_default()
         .to_owned();
-    debug!(
-        "STS GetCallerIdentity returned account {} in {:.2?}",
-        caller_account,
-        caller_identity_start.elapsed()
-    );
+    debug!("Caller account = {}", caller_account);
 
-    // ───────── parse requested Regions ─────────
+    // ───── parse Regions argument ─────
     let regions: Vec<Region> = opt
         .regions
         .split(',')
-        .map(|s| {
-            let s = s.trim();
-            debug!("Parsed Region argument: {}", s);
-            Region::new(s.to_owned())
-        })
+        .map(|s| Region::new(s.trim().to_owned()))
         .collect();
-    debug!("Final list of Regions to scan: {:?}", regions);
+    debug!("Regions to scan: {:?}", regions);
 
-    // ───────────────── execution paths ─────────────────
+    // ───── choose execution path ─────
     if opt.use_org {
-        // A) Enumerate every account in the Organization
         enumerate_organization(&base_conf, &regions).await?;
     } else if !opt.role_arns.is_empty() {
-        // B) Use explicit role ARNs
         process_role_arns(&base_conf, &regions, &caller_account, &opt.role_arns).await?;
     } else {
-        // C) No role ARNs → just use current creds
-        info!("Listing RDS in *current* account {}", caller_account);
+        info!("Listing RDS in current account {}", caller_account);
         list_rds(&base_conf, &regions).await?;
     }
 
@@ -111,7 +126,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// ───────────────── helper: enumerate Organization ─────────────────
+/// Return an OS‑appropriate log directory, creating it if necessary.
+pub fn get_or_create_log_dir() -> PathBuf {
+    let dir = {
+        #[cfg(target_os = "macos")]
+        {
+            let home = env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+            PathBuf::from(home).join("Library").join("Logs").join("slam")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Ok(xdg_state) = env::var("XDG_STATE_HOME") {
+                PathBuf::from(xdg_state).join("slam")
+            } else if let Ok(home) = env::var("HOME") {
+                PathBuf::from(home).join(".local").join("state").join("slam")
+            } else {
+                PathBuf::from("slam_logs")
+            }
+        }
+    };
+
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("Failed to create log directory {}: {}", dir.display(), e);
+    }
+    dir
+}
+
+// ------------- helper: enumerate Organization -------------
 async fn enumerate_organization(base_conf: &SdkConfig, regions: &[Region]) -> Result<()> {
     info!("Enumerating accounts via AWS Organizations…");
     let org_client = org::Client::new(base_conf);
@@ -128,7 +169,7 @@ async fn enumerate_organization(base_conf: &SdkConfig, regions: &[Region]) -> Re
     Ok(())
 }
 
-// ───────────────── helper: process --role-arns ────────────────────
+// ------------- helper: process --role-arns -------------
 async fn process_role_arns(
     base_conf: &SdkConfig,
     regions: &[Region],
@@ -138,13 +179,10 @@ async fn process_role_arns(
     info!("Using explicit role ARNs…");
     for arn in arns {
         let arn_account = arn.split(':').nth(4).unwrap_or_default();
-        debug!(
-            "Examining ARN {}  (account = {}, caller_account = {})",
-            arn, arn_account, caller_account
-        );
+        debug!("Examining ARN {} (account {})", arn, arn_account);
 
         if arn_account == caller_account {
-            info!("→ {} is the *current* account – skipping AssumeRole", arn);
+            info!("→ {} is in current account – skipping AssumeRole", arn);
             list_rds(base_conf, regions).await?;
         } else {
             info!("→ Assuming {}", arn);
@@ -154,13 +192,12 @@ async fn process_role_arns(
     Ok(())
 }
 
-// ───────────────── helper: list with existing creds ───────────────
+// ------------- helper: list RDS with existing creds -------------
 async fn list_rds(base_conf: &SdkConfig, regions: &[Region]) -> Result<()> {
     debug!("Entering list_rds()");
     for region in regions {
         info!("→ Region {}", region);
 
-        debug!("  Building per‑Region config (no assume) …");
         let conf = aws_config::defaults(BehaviorVersion::latest())
             .region(RegionProviderChain::first_try(region.clone()))
             .credentials_provider(
@@ -171,7 +208,6 @@ async fn list_rds(base_conf: &SdkConfig, regions: &[Region]) -> Result<()> {
             )
             .load()
             .await;
-        debug!("  Config for {} built", region);
 
         let client = rds::Client::new(&conf);
 
@@ -194,14 +230,18 @@ async fn list_rds(base_conf: &SdkConfig, regions: &[Region]) -> Result<()> {
     Ok(())
 }
 
-// ─────────── helper: AssumeRole then list RDS ────────────
-async fn scan_account(base_conf: &SdkConfig, regions: &[Region], role_arn: &str) -> Result<()> {
+// ------------- helper: AssumeRole then list RDS -------------
+async fn scan_account(
+    base_conf: &SdkConfig,
+    regions: &[Region],
+    role_arn: &str,
+) -> Result<()> {
     info!("--- Scanning with role {}", role_arn);
     let scan_start = Instant::now();
 
     for region in regions {
         info!("→ Region {}", region);
-        debug!("  Building AssumeRoleProvider for {}", region);
+
         let provider = AssumeRoleProvider::builder(role_arn.to_owned())
             .session_name("ls-rds")
             .region(region.clone())
@@ -209,7 +249,6 @@ async fn scan_account(base_conf: &SdkConfig, regions: &[Region], role_arn: &str)
             .build()
             .await;
 
-        debug!("  Building per‑Region config with assumed creds…");
         let conf = aws_config::defaults(BehaviorVersion::latest())
             .region(RegionProviderChain::first_try(region.clone()))
             .credentials_provider(provider)
