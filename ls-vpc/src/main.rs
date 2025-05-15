@@ -1,4 +1,4 @@
-//! ls-vpc 0.5.1
+//! ls-vpc 0.5.2
 //! ---------------------------------------------------------------------------
 //! Summary  (no VPC IDs) → only VPC rows + CIDR blocks
 //! Detail   (with IDs)   → VPC rows + CIDR blocks + “infra:” section listing
@@ -7,6 +7,7 @@
 //! Region) without panicking.
 
 use std::{
+    collections::BTreeMap,
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -365,6 +366,86 @@ async fn get_cidrs(conf: &SdkConfig, vpc_id: &str) -> Result<Vec<String>> {
     Ok(cidrs)
 }
 
+/*──────── helper: column widths ─────*/
+
+fn column_widths(
+    vpcs: &BTreeMap<(String, String), VpcSummary>,
+) -> (usize, usize, usize, usize) {
+    let mut region_w = "REGION".len();
+    let mut vis_w = "VIS".len();
+    let mut peer_w = "PEERING".len();
+    let mut vpc_w = "VPC-ID".len();
+
+    for ((region, vpc_id), summary) in vpcs {
+        region_w = region_w.max(region.len());
+        let vis_len = if summary.public { "public".len() } else { "private".len() };
+        vis_w = vis_w.max(vis_len);
+        let peer_len = match summary.peering {
+            Peering::Peered => "peered".len(),
+            Peering::Unpeered => "unpeered".len(),
+        };
+        peer_w = peer_w.max(peer_len);
+        vpc_w = vpc_w.max(vpc_id.len());
+    }
+
+    (region_w, vis_w, peer_w, vpc_w)
+}
+
+/*──────── helper: render report ─────*/
+
+fn print_report(
+    vpcs: &BTreeMap<(String, String), VpcSummary>,
+    summary_only: bool,
+) {
+    let (region_w, vis_w, peer_w, vpc_w) = column_widths(vpcs);
+
+    println!(
+        "{:<region_w$} {:<vis_w$} {:<peer_w$} {:<vpc_w$} | {}",
+        "REGION",
+        "VIS",
+        "PEERING",
+        "VPC-ID",
+        "NAME",
+        region_w = region_w,
+        vis_w = vis_w,
+        peer_w = peer_w,
+        vpc_w = vpc_w
+    );
+
+    let dash_len = region_w + 1 + vis_w + 1 + peer_w + 1 + vpc_w + 3 + 40;
+    println!("{}", "-".repeat(dash_len));
+
+    for ((region, vpc_id), s) in vpcs {
+        println!(
+            "{:<region_w$} {:<vis_w$} {:<peer_w$} {:<vpc_w$} | {}",
+            region,
+            if s.public { "public" } else { "private" },
+            match s.peering {
+                Peering::Peered => "peered",
+                Peering::Unpeered => "unpeered",
+            },
+            vpc_id,
+            s.name.as_deref().unwrap_or(""),
+            region_w = region_w,
+            vis_w = vis_w,
+            peer_w = peer_w,
+            vpc_w = vpc_w
+        );
+
+        if !s.cidrs.is_empty() {
+            println!("  {}", s.cidrs.join(", "));
+        }
+
+        if !summary_only && !s.resources.is_empty() {
+            println!("infra:");
+            for r in &s.resources {
+                println!("  {:<22} {:<28} {}", r.rtype, r.name, r.arn);
+            }
+            println!();
+        }
+    }
+}
+
 /*──────── main ─────*/
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -395,7 +476,7 @@ async fn main() -> Result<()> {
     let scanners: Vec<Box<dyn ServiceScanner>> =
         vec![Box::new(Ec2Scanner), Box::new(ElbScanner), Box::new(RdsScanner)];
 
-    let mut vpcs = std::collections::BTreeMap::new();
+    let mut vpcs: BTreeMap<(String, String), VpcSummary> = BTreeMap::new();
     let start = Instant::now();
 
     for region_name in &opt.regions {
@@ -424,39 +505,7 @@ async fn main() -> Result<()> {
     }
 
     /* output */
-    println!(
-        "{:<10} {:<7} {:<8} {:<20} | {}",
-        "REGION", "VIS", "PEERING", "VPC-ID", "NAME"
-    );
-    println!("{}", "-".repeat(10 + 1 + 7 + 1 + 8 + 1 + 20 + 3 + 40));
-
-    for ((region, vpc_id), s) in &vpcs {
-        println!(
-            "{:<10} {:<7} {:<8} {:<20} | {}",
-            region,
-            if s.public { "public" } else { "private" },
-            match s.peering {
-                Peering::Peered => "peered",
-                Peering::Unpeered => "unpeered",
-            },
-            vpc_id,
-            s.name.as_deref().unwrap_or("")
-        );
-
-        /* CIDR line */
-        if !s.cidrs.is_empty() {
-            println!("  {}", s.cidrs.join(", "));
-        }
-
-        /* Resources */
-        if !summary_only && !s.resources.is_empty() {
-            println!("infra:");
-            for r in &s.resources {
-                println!("  {:<22} {:<28} {}", r.rtype, r.name, r.arn);
-            }
-            println!();
-        }
-    }
+    print_report(&vpcs, summary_only);
 
     println!(
         "Finished in {:.2?} – {} VPC(s) across {} Region(s)",
