@@ -1,10 +1,9 @@
-//! ls-vpc 0.5.2
+//! ls-vpc 0.5.3
 //! ---------------------------------------------------------------------------
-//! Summary  (no VPC IDs) → only VPC rows + CIDR blocks
-//! Detail   (with IDs)   → VPC rows + CIDR blocks + “infra:” section listing
-//!                         all attached resources
-//! Any InvalidVpcID.NotFound error is **silently skipped** (works in every
-//! Region) without panicking.
+//! Summary  (no VPC IDs) → only VPC rows
+//! Detail   (with IDs)   → VPC rows + “infra:” section listing attached resources
+//! CIDR column is shown in-row; multiple CIDRs are comma-separated.
+//! Any InvalidVpcID.NotFound error is **silently skipped** without panicking.
 
 use std::{
     collections::BTreeMap,
@@ -223,7 +222,7 @@ impl ServiceScanner for RdsScanner {
             }
         }
 
-        /* RDS clusters (no cheap VPC filter available) */
+        /* RDS clusters */
         for cl in client.describe_db_clusters().send().await?.db_clusters() {
             recs.push(ResourceRecord {
                 arn: cl.db_cluster_arn().unwrap_or_default().to_owned(),
@@ -232,7 +231,7 @@ impl ServiceScanner for RdsScanner {
             });
         }
 
-        /* DocDB clusters (same) */
+        /* DocDB clusters */
         let dclient = docdb::Client::new(sdk);
         for cl in dclient.describe_db_clusters().send().await?.db_clusters() {
             recs.push(ResourceRecord {
@@ -254,7 +253,6 @@ async fn list_vpcs(
 ) -> Result<Vec<(String, Option<String>)>> {
     let client = ec2::Client::new(conf);
 
-    // No filter? --> return every VPC in the region
     if filter.is_empty() {
         let resp = client.describe_vpcs().send().await?;
         return Ok(resp
@@ -272,7 +270,6 @@ async fn list_vpcs(
             .collect());
     }
 
-    // Filtered lookup
     let mut out = Vec::new();
     for id in filter {
         match client.describe_vpcs().vpc_ids(id).send().await {
@@ -287,12 +284,10 @@ async fn list_vpcs(
                     out.push((v.vpc_id().unwrap_or_default().to_owned(), name));
                 }
             }
-            // Silently skip “does not exist” in this region
             Err(e) if e.code() == Some("InvalidVpcID.NotFound") => {
                 trace!("{id} absent in this region – skipped");
                 continue;
             }
-            // Anything else bubbles up
             Err(e) => return Err(e.into()),
         }
     }
@@ -370,25 +365,25 @@ async fn get_cidrs(conf: &SdkConfig, vpc_id: &str) -> Result<Vec<String>> {
 
 fn column_widths(
     vpcs: &BTreeMap<(String, String), VpcSummary>,
-) -> (usize, usize, usize, usize) {
+) -> (usize, usize, usize, usize, usize) {
     let mut region_w = "REGION".len();
     let mut vis_w = "VIS".len();
     let mut peer_w = "PEERING".len();
     let mut vpc_w = "VPC-ID".len();
+    let mut cidr_w = "CIDR".len();
 
     for ((region, vpc_id), summary) in vpcs {
         region_w = region_w.max(region.len());
-        let vis_len = if summary.public { "public".len() } else { "private".len() };
-        vis_w = vis_w.max(vis_len);
-        let peer_len = match summary.peering {
-            Peering::Peered => "peered".len(),
-            Peering::Unpeered => "unpeered".len(),
-        };
-        peer_w = peer_w.max(peer_len);
+        vis_w = vis_w.max(if summary.public { 6 } else { 7 }); // public/private
+        peer_w = peer_w.max(match summary.peering {
+            Peering::Peered => 6,
+            Peering::Unpeered => 8,
+        });
         vpc_w = vpc_w.max(vpc_id.len());
+        cidr_w = cidr_w.max(summary.cidrs.join(",").len());
     }
 
-    (region_w, vis_w, peer_w, vpc_w)
+    (region_w, vis_w, peer_w, vpc_w, cidr_w)
 }
 
 /*──────── helper: render report ─────*/
@@ -397,27 +392,30 @@ fn print_report(
     vpcs: &BTreeMap<(String, String), VpcSummary>,
     summary_only: bool,
 ) {
-    let (region_w, vis_w, peer_w, vpc_w) = column_widths(vpcs);
+    let (region_w, vis_w, peer_w, vpc_w, cidr_w) = column_widths(vpcs);
 
     println!(
-        "{:<region_w$} {:<vis_w$} {:<peer_w$} {:<vpc_w$} | {}",
+        "{:<region_w$} {:<vis_w$} {:<peer_w$} {:<vpc_w$} {:<cidr_w$} | {}",
         "REGION",
         "VIS",
         "PEERING",
         "VPC-ID",
+        "CIDR",
         "NAME",
         region_w = region_w,
         vis_w = vis_w,
         peer_w = peer_w,
-        vpc_w = vpc_w
+        vpc_w = vpc_w,
+        cidr_w = cidr_w
     );
 
-    let dash_len = region_w + 1 + vis_w + 1 + peer_w + 1 + vpc_w + 3 + 40;
+    let dash_len = region_w + 1 + vis_w + 1 + peer_w + 1 + vpc_w + 1 + cidr_w + 3 + 40;
     println!("{}", "-".repeat(dash_len));
 
     for ((region, vpc_id), s) in vpcs {
+        let cidr_col = s.cidrs.join(",");
         println!(
-            "{:<region_w$} {:<vis_w$} {:<peer_w$} {:<vpc_w$} | {}",
+            "{:<region_w$} {:<vis_w$} {:<peer_w$} {:<vpc_w$} {:<cidr_w$} | {}",
             region,
             if s.public { "public" } else { "private" },
             match s.peering {
@@ -425,16 +423,14 @@ fn print_report(
                 Peering::Unpeered => "unpeered",
             },
             vpc_id,
+            cidr_col,
             s.name.as_deref().unwrap_or(""),
             region_w = region_w,
             vis_w = vis_w,
             peer_w = peer_w,
-            vpc_w = vpc_w
+            vpc_w = vpc_w,
+            cidr_w = cidr_w
         );
-
-        if !s.cidrs.is_empty() {
-            println!("  {}", s.cidrs.join(", "));
-        }
 
         if !summary_only && !s.resources.is_empty() {
             println!("infra:");
