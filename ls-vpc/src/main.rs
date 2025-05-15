@@ -1,8 +1,7 @@
-//! ls-vpc 0.5.3
+//! ls-vpc 0.6.1
 //! ---------------------------------------------------------------------------
-//! Summary  (no VPC IDs) → only VPC rows
-//! Detail   (with IDs)   → VPC rows + “infra:” section listing attached resources
-//! CIDR column is shown in-row; multiple CIDRs are comma-separated.
+//! Summary  (no VPC IDs) → Comfy-table output
+//! Detail   (with IDs)   → Custom ASCII output with “infra:” section
 //! Any InvalidVpcID.NotFound error is **silently skipped** without panicking.
 
 use std::{
@@ -23,6 +22,7 @@ use aws_sdk_elasticloadbalancingv2 as elbv2;
 use aws_sdk_rds as rds;
 use aws_types::{region::Region, SdkConfig};
 use clap::{Parser, ValueHint};
+use comfy_table::{Table, presets::ASCII_FULL};
 use env_logger::Target;
 use eyre::{eyre, Result};
 use log::trace;
@@ -361,7 +361,7 @@ async fn get_cidrs(conf: &SdkConfig, vpc_id: &str) -> Result<Vec<String>> {
     Ok(cidrs)
 }
 
-/*──────── helper: column widths ─────*/
+/*──────── helper: column widths for detail view ─────*/
 
 fn column_widths(
     vpcs: &BTreeMap<(String, String), VpcSummary>,
@@ -374,7 +374,7 @@ fn column_widths(
 
     for ((region, vpc_id), summary) in vpcs {
         region_w = region_w.max(region.len());
-        vis_w = vis_w.max(if summary.public { 6 } else { 7 }); // public/private
+        vis_w = vis_w.max(if summary.public { 6 } else { 7 });
         peer_w = peer_w.max(match summary.peering {
             Peering::Peered => 6,
             Peering::Unpeered => 8,
@@ -386,12 +386,36 @@ fn column_widths(
     (region_w, vis_w, peer_w, vpc_w, cidr_w)
 }
 
-/*──────── helper: render report ─────*/
+/*──────── summary report (Comfy-table) ─────*/
 
-fn print_report(
-    vpcs: &BTreeMap<(String, String), VpcSummary>,
-    summary_only: bool,
-) {
+fn print_summary_table(vpcs: &BTreeMap<(String, String), VpcSummary>) {
+    let mut table = Table::new();
+    table.load_preset(ASCII_FULL);
+    table.set_header(vec!["REGION", "VIS", "PEERING", "VPC-ID", "CIDR", "NAME"]);
+
+    for ((region, vpc_id), s) in vpcs {
+        let vis = if s.public { "public" } else { "private" };
+        let peer = match s.peering {
+            Peering::Peered => "peered",
+            Peering::Unpeered => "unpeered",
+        };
+        let cidr_col = s.cidrs.join(",");
+        table.add_row(vec![
+            region.clone(),
+            vis.to_owned(),
+            peer.to_owned(),
+            vpc_id.clone(),
+            cidr_col,
+            s.name.clone().unwrap_or_default(),
+        ]);
+    }
+
+    println!("{table}");
+}
+
+/*──────── detail report (custom ASCII) ─────*/
+
+fn print_detail_table(vpcs: &BTreeMap<(String, String), VpcSummary>) {
     let (region_w, vis_w, peer_w, vpc_w, cidr_w) = column_widths(vpcs);
 
     println!(
@@ -432,7 +456,7 @@ fn print_report(
             cidr_w = cidr_w
         );
 
-        if !summary_only && !s.resources.is_empty() {
+        if !s.resources.is_empty() {
             println!("infra:");
             for r in &s.resources {
                 println!("  {:<22} {:<28} {}", r.rtype, r.name, r.arn);
@@ -501,7 +525,11 @@ async fn main() -> Result<()> {
     }
 
     /* output */
-    print_report(&vpcs, summary_only);
+    if summary_only {
+        print_summary_table(&vpcs);
+    } else {
+        print_detail_table(&vpcs);
+    }
 
     println!(
         "Finished in {:.2?} – {} VPC(s) across {} Region(s)",
