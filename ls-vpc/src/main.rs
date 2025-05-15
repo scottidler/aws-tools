@@ -1,8 +1,9 @@
-//! ls-vpc 0.4.7
+//! ls-vpc 0.5.1
 //! ---------------------------------------------------------------------------
-//! Summary  (no VPC IDs) → only VPC rows
-//! Detail   (with IDs)   → VPC rows + attached resources
-//! Any InvalidVpcID.NotFound error is now **silently skipped** (works in every
+//! Summary  (no VPC IDs) → only VPC rows + CIDR blocks
+//! Detail   (with IDs)   → VPC rows + CIDR blocks + “infra:” section listing
+//!                         all attached resources
+//! Any InvalidVpcID.NotFound error is **silently skipped** (works in every
 //! Region) without panicking.
 
 use std::{
@@ -45,6 +46,7 @@ struct VpcSummary {
     name: Option<String>,
     public: bool,
     peering: Peering,
+    cidrs: Vec<String>,
     resources: Vec<ResourceRecord>,
 }
 
@@ -335,6 +337,34 @@ async fn is_public(conf: &SdkConfig, vpc_id: &str) -> Result<bool> {
         .is_empty())
 }
 
+/*──────── helper: get_cidrs ─────*/
+
+async fn get_cidrs(conf: &SdkConfig, vpc_id: &str) -> Result<Vec<String>> {
+    let client = ec2::Client::new(conf);
+    let mut cidrs = Vec::new();
+
+    let resp = client.describe_vpcs().vpc_ids(vpc_id).send().await?;
+    if let Some(vpc) = resp.vpcs().first() {
+        if let Some(primary) = vpc.cidr_block() {
+            cidrs.push(primary.to_owned());
+        }
+        for assoc in vpc.cidr_block_association_set() {
+            if let Some(cidr) = assoc.cidr_block() {
+                cidrs.push(cidr.to_owned());
+            }
+        }
+        for ipv6 in vpc.ipv6_cidr_block_association_set() {
+            if let Some(cidr) = ipv6.ipv6_cidr_block() {
+                cidrs.push(cidr.to_owned());
+            }
+        }
+    }
+
+    cidrs.sort();
+    cidrs.dedup();
+    Ok(cidrs)
+}
+
 /*──────── main ─────*/
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -379,6 +409,7 @@ async fn main() -> Result<()> {
                 name: vpc_name,
                 public: is_public(&conf, &vpc_id).await?,
                 peering: peering_status(&conf, &vpc_id).await?,
+                cidrs: get_cidrs(&conf, &vpc_id).await?,
                 resources: Vec::new(),
             };
             if !summary_only {
@@ -411,13 +442,19 @@ async fn main() -> Result<()> {
             vpc_id,
             s.name.as_deref().unwrap_or("")
         );
-        if !summary_only {
+
+        /* CIDR line */
+        if !s.cidrs.is_empty() {
+            println!("  {}", s.cidrs.join(", "));
+        }
+
+        /* Resources */
+        if !summary_only && !s.resources.is_empty() {
+            println!("infra:");
             for r in &s.resources {
                 println!("  {:<22} {:<28} {}", r.rtype, r.name, r.arn);
             }
-            if !s.resources.is_empty() {
-                println!();
-            }
+            println!();
         }
     }
 
