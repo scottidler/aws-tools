@@ -21,7 +21,8 @@ use aws_config::BehaviorVersion;
 use aws_sdk_ec2 as ec2;
 use aws_types::{region::Region, SdkConfig};
 use clap::{Parser, ValueHint};
-use comfy_table::{presets::ASCII_FULL, Table};
+use comfy_table::Table;
+use comfy_table::presets::{ASCII_FULL, ASCII_FULL_CONDENSED};
 use env_logger::Target;
 use eyre::{eyre, Result};
 use log::trace;
@@ -179,67 +180,63 @@ async fn get_cidrs(conf: &SdkConfig, vpc_id: &str) -> Result<Vec<String>> {
 
 /*──────── text-table helpers (detail view only) ─────*/
 
-fn column_widths(vpcs: &BTreeMap<(String, String), VpcSummary>) -> (usize, usize, usize, usize, usize) {
-    let mut region_w = "REGION".len();
-    let mut vis_w    = "VIS".len();
-    let mut peer_w   = "PEERING".len();
-    let mut vpc_w    = "VPC-ID".len();
-    let mut cidr_w   = "CIDR".len();
-
-    for ((region, vpc_id), s) in vpcs {
-        region_w = region_w.max(region.len());
-        vis_w    = vis_w.max(if s.public { 6 } else { 7 });
-        peer_w   = peer_w.max(match s.peering { Peering::Peered => 6, Peering::Unpeered => 8 });
-        vpc_w    = vpc_w.max(vpc_id.len());
-        cidr_w   = cidr_w.max(s.cidrs.join(",").len());
-    }
-
-    (region_w, vis_w, peer_w, vpc_w, cidr_w)
-}
-
 fn print_detail_table(vpcs: &BTreeMap<(String, String), VpcSummary>) {
-    let (region_w, vis_w, peer_w, vpc_w, cidr_w) = column_widths(vpcs);
-
-    println!(
-        "{:<region_w$} {:<vis_w$} {:<peer_w$} {:<vpc_w$} {:<cidr_w$} | {}",
-        "REGION", "VIS", "PEERING", "VPC-ID", "CIDR", "NAME",
-        region_w = region_w, vis_w = vis_w, peer_w = peer_w, vpc_w = vpc_w, cidr_w = cidr_w
-    );
-    let dash_len = region_w + vis_w + peer_w + vpc_w + cidr_w + /*  separators */ 1*4 + 3 + 40;
-    println!("{}", "-".repeat(dash_len));
 
     for ((region, vpc_id), s) in vpcs {
-        println!(
-            "{:<region_w$} {:<vis_w$} {:<peer_w$} {:<vpc_w$} {:<cidr_w$} | {}",
-            region,
-            if s.public { "public" } else { "private" },
-            match s.peering { Peering::Peered => "peered", Peering::Unpeered => "unpeered" },
-            vpc_id,
-            s.cidrs.join(","),
-            s.name.as_deref().unwrap_or(""),
-            region_w = region_w, vis_w = vis_w, peer_w = peer_w, vpc_w = vpc_w, cidr_w = cidr_w
-        );
+        /* ── summary table ──────────────────────────────────────────────── */
+        let mut summary = Table::new();
+        summary.load_preset(ASCII_FULL);
+        summary.set_header(vec!["REGION", "VIS", "PEERING", "VPC-ID", "CIDR", "NAME"]);
 
+        let vis  = if s.public { "public" } else { "private" };
+        let peer = match s.peering { Peering::Peered => "peered", Peering::Unpeered => "unpeered" };
+
+        summary.add_row(vec![
+            region.clone(),
+            vis.into(),
+            peer.into(),
+            vpc_id.clone(),
+            s.cidrs.join(","),
+            s.name.clone().unwrap_or_default(),
+        ]);
+
+        println!("{summary}");
+
+        /* ── resource table (condensed) ─────────────────────────────────── */
         if !s.resources.is_empty() {
-            println!("infra:");
+            let mut detail = Table::new();
+            detail.load_preset(ASCII_FULL_CONDENSED);
+            detail.set_header(vec!["TYPE", "NAME", "IDENTIFIER / ARN"]);
+
             for r in &s.resources {
-                println!("  {:<22} {:<28} {}", r.rtype, r.name, r.arn);
+                detail.add_row(vec![
+                    r.rtype.to_owned(),
+                    r.name.clone(),
+                    r.arn.clone(),
+                ]);
             }
-            println!();
+
+            println!("{detail}");
         }
+
+        println!(); // blank line between VPC blocks
     }
 }
 
 /*──────── Comfy-table summary ─────*/
 
 fn print_summary_table(vpcs: &BTreeMap<(String, String), VpcSummary>) {
+    use comfy_table::presets::ASCII_FULL_CONDENSED;
+    use comfy_table::Table;
+
     let mut table = Table::new();
-    table.load_preset(ASCII_FULL);
+    table.load_preset(ASCII_FULL_CONDENSED);
     table.set_header(vec!["REGION", "VIS", "PEERING", "VPC-ID", "CIDR", "NAME"]);
 
     for ((region, vpc_id), s) in vpcs {
         let vis  = if s.public { "public" } else { "private" };
         let peer = match s.peering { Peering::Peered => "peered", Peering::Unpeered => "unpeered" };
+
         table.add_row(vec![
             region.clone(),
             vis.to_owned(),
