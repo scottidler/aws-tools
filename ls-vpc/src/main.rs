@@ -248,19 +248,89 @@ fn print_summary_table(vpcs: &BTreeMap<(String, String), VpcSummary>) {
 }
 
 fn print_detail_table(vpcs: &BTreeMap<(String, String), VpcSummary>) {
+    use crate::utils::{terminal_width, wrap_identifier};
+    use comfy_table::{
+        ColumnConstraint,           // ← constraint enum
+        ContentArrangement,         // ← keep dynamic layout
+        Width,                      // ← Fixed / Percent variants
+    };
+
+    // --------------------------------------------------------------------
+    // Work out the terminal width and some hard limits for each column
+    // --------------------------------------------------------------------
+    let term_w               = terminal_width();      // full TTY width
+    let borders_and_padding  = 10usize;               // | … | … | … |
+    let min_arn_width        = 20usize;               // never smaller
+    let name_soft_cap        = term_w / 3;            // NAME col clamp
+
     for ((region, vpc_id), s) in vpcs {
+        // ----------------------- summary row ----------------------------
         let mut summary = Table::new();
         summary.load_preset(ASCII_FULL);
         summary.set_header(summary_headers());
         summary.add_row(summary_row(region, vpc_id, s));
         println!("{summary}");
+
+        // ---------------- resource-level detail -------------------------
         if !s.resources.is_empty() {
+            // Longest strings in TYPE / NAME columns
+            let type_col_len = s
+                .resources
+                .iter()
+                .map(|r| r.rtype.len())
+                .max()
+                .unwrap_or(4)
+                .min(25);                 // TYPE never absurdly wide
+
+            let name_col_len = s
+                .resources
+                .iter()
+                .map(|r| r.name.len())
+                .max()
+                .unwrap_or(4)
+                .min(name_soft_cap);      // NAME clamped
+
+            // Whatever is left goes to the ARN column
+            let arn_col_len = term_w
+                .saturating_sub(type_col_len + name_col_len + borders_and_padding)
+                .max(min_arn_width);
+
             let mut detail = Table::new();
             detail.load_preset(ASCII_FULL_CONDENSED);
             detail.set_header(vec!["TYPE", "NAME", "IDENTIFIER / ARN"]);
+            detail.set_content_arrangement(ContentArrangement::DynamicFullWidth);
+
+            // ---------------- per-column constraints --------------------
+            detail
+                .column_mut(0)
+                .expect("TYPE column exists")
+                .set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(
+                    type_col_len as u16,
+                )));
+
+            detail
+                .column_mut(1)
+                .expect("NAME column exists")
+                .set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(
+                    name_col_len as u16,
+                )));
+
+            detail
+                .column_mut(2)
+                .expect("ARN column exists")
+                .set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(
+                    arn_col_len as u16,
+                )));
+
+            // ----------------- populate the table -----------------------
             for r in &s.resources {
-                detail.add_row(vec![r.rtype.to_owned(), r.name.clone(), r.arn.clone()]);
+                detail.add_row(vec![
+                    r.rtype.to_owned(),
+                    r.name.clone(),
+                    wrap_identifier(&r.arn, arn_col_len),
+                ]);
             }
+
             println!("{detail}");
         }
         println!();
