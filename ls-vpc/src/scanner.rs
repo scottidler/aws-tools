@@ -12,8 +12,6 @@ use aws_sdk_rds as rds;
 use aws_types::SdkConfig;
 use eyre::Result;
 
-/*──────── domain type ───────*/
-
 /// A single AWS resource that lives inside a VPC (instance, ENI, DB cluster…).
 #[derive(Debug)]
 pub struct ResourceRecord {
@@ -22,14 +20,10 @@ pub struct ResourceRecord {
     pub name: String,
 }
 
-/*──────── public trait ─────*/
-
 #[async_trait]
 pub trait ServiceScanner: Send + Sync {
     async fn scan(&self, sdk: &SdkConfig, vpc_id: &str) -> Result<Vec<ResourceRecord>>;
 }
-
-/*──────── EC2 scanner ─────*/
 
 pub struct Ec2Scanner;
 
@@ -39,7 +33,6 @@ impl ServiceScanner for Ec2Scanner {
         let client = ec2::Client::new(sdk);
         let mut recs = Vec::new();
 
-        /* instances */
         let mut pages = client
             .describe_instances()
             .filters(
@@ -67,7 +60,6 @@ impl ServiceScanner for Ec2Scanner {
             }
         }
 
-        /* ENIs */
         for eni in client
             .describe_network_interfaces()
             .filters(
@@ -87,7 +79,6 @@ impl ServiceScanner for Ec2Scanner {
             });
         }
 
-        /* NAT Gateways */
         for ngw in client
             .describe_nat_gateways()
             .filter(
@@ -107,7 +98,6 @@ impl ServiceScanner for Ec2Scanner {
             });
         }
 
-        /* Flow logs */
         for fl in client
             .describe_flow_logs()
             .filter(
@@ -130,8 +120,6 @@ impl ServiceScanner for Ec2Scanner {
         Ok(recs)
     }
 }
-
-/*──────── ELBv2 scanner ─────*/
 
 pub struct ElbScanner;
 
@@ -165,8 +153,6 @@ impl ServiceScanner for ElbScanner {
     }
 }
 
-/*──────── RDS / DocDB scanner ─────*/
-
 pub struct RdsScanner;
 
 #[async_trait]
@@ -175,7 +161,6 @@ impl ServiceScanner for RdsScanner {
         let client = rds::Client::new(sdk);
         let mut recs = Vec::new();
 
-        /* RDS instances */
         for db in client.describe_db_instances().send().await?.db_instances() {
             if db
                 .db_subnet_group()
@@ -190,7 +175,6 @@ impl ServiceScanner for RdsScanner {
             }
         }
 
-        /* RDS clusters */
         for cl in client.describe_db_clusters().send().await?.db_clusters() {
             recs.push(ResourceRecord {
                 arn: cl.db_cluster_arn().unwrap_or_default().to_owned(),
@@ -199,7 +183,6 @@ impl ServiceScanner for RdsScanner {
             });
         }
 
-        /* DocDB clusters */
         let dclient = docdb::Client::new(sdk);
         for cl in dclient.describe_db_clusters().send().await?.db_clusters() {
             recs.push(ResourceRecord {

@@ -29,18 +29,6 @@ use log::trace;
 
 use aws_sdk_docdb::error::ProvideErrorMetadata;
 
-/*──────── additional domain types ─────*/
-
-#[derive(Debug)]
-struct VpcSummary {
-    name:     Option<String>,
-    public:   bool,
-    cidrs:    Vec<String>,
-    peers:    Vec<String>,
-    resources: Vec<scanner::ResourceRecord>,
-}
-
-/*──────── CLI ───────*/
 #[derive(Parser, Debug)]
 #[command(name = "ls-vpc", author, version, about)]
 struct Opt {
@@ -68,33 +56,35 @@ struct Opt {
     vpc_ids: Vec<String>,
 }
 
-/*──────── AWS helpers ─────*/
+#[derive(Debug)]
+struct VpcSummary {
+    name:     Option<String>,
+    public:   bool,
+    cidrs:    Vec<String>,
+    peers:    Vec<String>,
+    resources: Vec<scanner::ResourceRecord>,
+}
 
-/// Return `(vpc_id, vpc_name)` for either **all** VPCs in a region
-/// or only the ones explicitly requested.
-/// Silently skips `InvalidVpcID.NotFound` errors.
-async fn list_vpcs(conf: &SdkConfig, filter: &[String]) -> Result<Vec<(String, Option<String>)>> {
-    let client = ec2::Client::new(conf);
+fn summary_headers() -> Vec<&'static str> {
+    vec!["REGION", "VIS", "CIDR", "VPC-ID", "PEERS", "NAME"]
+}
 
-    // No filter → every VPC in the region
-    if filter.is_empty() {
-        let resp = client.describe_vpcs().send().await?;
-        return Ok(resp
-            .vpcs()
-            .iter()
-            .map(|v| {
-                let name = v
-                    .tags()
-                    .iter()
-                    .find(|t| t.key() == Some("Name"))
-                    .and_then(|t| t.value())
-                    .map(|s| s.to_owned());
-                (v.vpc_id().unwrap_or_default().to_owned(), name)
-            })
-            .collect());
-    }
+fn summary_row(region: &str, vpc_id: &str, s: &VpcSummary) -> Vec<String> {
+    let vis = if s.public { "public" } else { "private" };
+    vec![
+        region.to_owned(),
+        vis.to_owned(),
+        s.cidrs.join(","),
+        vpc_id.to_owned(),
+        s.peers.join(","),
+        s.name.clone().unwrap_or_default(),
+    ]
+}
 
-    // Filtered lookup
+async fn list_filtered_vpcs(
+    client: &ec2::Client,
+    filter: &[String],
+) -> Result<Vec<(String, Option<String>)>> {
     let mut out = Vec::new();
     for id in filter {
         match client.describe_vpcs().vpc_ids(id).send().await {
@@ -111,7 +101,6 @@ async fn list_vpcs(conf: &SdkConfig, filter: &[String]) -> Result<Vec<(String, O
             }
             Err(e) if e.code() == Some("InvalidVpcID.NotFound") => {
                 trace!("{id} absent in this region – skipped");
-                continue;
             }
             Err(e) => return Err(e.into()),
         }
@@ -119,7 +108,33 @@ async fn list_vpcs(conf: &SdkConfig, filter: &[String]) -> Result<Vec<(String, O
     Ok(out)
 }
 
-/// Is at least one Internet-gateway attached?
+async fn list_vpcs(conf: &SdkConfig, filter: &[String]) -> Result<Vec<(String, Option<String>)>> {
+    let client = ec2::Client::new(conf);
+    if filter.is_empty() {
+        return list_all_vpcs(&client).await;
+    }
+    list_filtered_vpcs(&client, filter).await
+}
+
+async fn list_all_vpcs(client: &ec2::Client) -> Result<Vec<(String, Option<String>)>> {
+    Ok(client
+        .describe_vpcs()
+        .send()
+        .await?
+        .vpcs()
+        .iter()
+        .map(|v| {
+            let name = v
+                .tags()
+                .iter()
+                .find(|t| t.key() == Some("Name"))
+                .and_then(|t| t.value())
+                .map(|s| s.to_owned());
+            (v.vpc_id().unwrap_or_default().to_owned(), name)
+        })
+        .collect())
+}
+
 async fn is_public(conf: &SdkConfig, vpc_id: &str) -> Result<bool> {
     let client = ec2::Client::new(conf);
     Ok(!client
@@ -136,53 +151,59 @@ async fn is_public(conf: &SdkConfig, vpc_id: &str) -> Result<bool> {
         .is_empty())
 }
 
-/*──────── helpers ─────*/
-
-async fn get_peer_vpcs(conf: &SdkConfig, vpc_id: &str) -> Result<Vec<String>> {
+async fn collect_peers<F>(
+    client: &ec2::Client,
+    vpc_id: &str,
+    filter_name: &str,
+    extract_other: F,
+) -> Result<Vec<String>>
+where
+    F: Fn(&aws_sdk_ec2::types::VpcPeeringConnection) -> Option<&str>,
+{
     use aws_sdk_ec2::types::VpcPeeringConnectionStateReasonCode as State;
 
-    let client = ec2::Client::new(conf);
-    let mut peers = Vec::new();
-
-    /* requester side → accepter is “the other side” */
     let resp = client
         .describe_vpc_peering_connections()
         .filters(
             ec2::types::Filter::builder()
-                .name("requester-vpc-info.vpc-id")
+                .name(filter_name)
                 .values(vpc_id)
                 .build(),
         )
         .send()
         .await?;
 
+    let mut peers = Vec::new();
     for pc in resp.vpc_peering_connections() {
         if matches!(pc.status().and_then(|s| s.code()), Some(State::Active)) {
-            if let Some(pid) = pc.accepter_vpc_info().and_then(|i| i.vpc_id()) {
+            if let Some(pid) = extract_other(pc) {
                 peers.push(pid.to_owned());
             }
         }
     }
+    Ok(peers)
+}
 
-    /* accepter side → requester is “the other side” */
-    let resp2 = client
-        .describe_vpc_peering_connections()
-        .filters(
-            ec2::types::Filter::builder()
-                .name("accepter-vpc-info.vpc-id")
-                .values(vpc_id)
-                .build(),
+async fn get_peer_vpcs(conf: &SdkConfig, vpc_id: &str) -> Result<Vec<String>> {
+    let client = ec2::Client::new(conf);
+
+    let mut peers = collect_peers(
+        &client,
+        vpc_id,
+        "requester-vpc-info.vpc-id",
+        |pc| pc.accepter_vpc_info().and_then(|i| i.vpc_id()),
+    )
+    .await?;
+
+    peers.extend(
+        collect_peers(
+            &client,
+            vpc_id,
+            "accepter-vpc-info.vpc-id",
+            |pc| pc.requester_vpc_info().and_then(|i| i.vpc_id()),
         )
-        .send()
-        .await?;
-
-    for pc in resp2.vpc_peering_connections() {
-        if matches!(pc.status().and_then(|s| s.code()), Some(State::Active)) {
-            if let Some(pid) = pc.requester_vpc_info().and_then(|i| i.vpc_id()) {
-                peers.push(pid.to_owned());
-            }
-        }
-    }
+        .await?,
+    );
 
     peers.sort();
     peers.dedup();
@@ -219,69 +240,32 @@ async fn get_cidrs(conf: &SdkConfig, vpc_id: &str) -> Result<Vec<String>> {
 fn print_summary_table(vpcs: &BTreeMap<(String, String), VpcSummary>) {
     let mut table = Table::new();
     table.load_preset(ASCII_FULL_CONDENSED);
-    table.set_header(vec![
-        "REGION", "VIS", "CIDR", "VPC-ID", "PEERS", "NAME",
-    ]);
-
+    table.set_header(summary_headers());
     for ((region, vpc_id), s) in vpcs {
-        let vis = if s.public { "public" } else { "private" };
-
-        table.add_row(vec![
-            region.clone(),
-            vis.to_owned(),
-            s.cidrs.join(","),
-            vpc_id.clone(),
-            s.peers.join(","),
-            s.name.clone().unwrap_or_default(),
-        ]);
+        table.add_row(summary_row(region, vpc_id, s));
     }
-
     println!("{table}");
 }
 
 fn print_detail_table(vpcs: &BTreeMap<(String, String), VpcSummary>) {
     for ((region, vpc_id), s) in vpcs {
-        /* ── one-row summary table ─────────────────────────────────────── */
         let mut summary = Table::new();
         summary.load_preset(ASCII_FULL);
-        summary.set_header(vec![
-            "REGION", "VIS", "CIDR", "VPC-ID", "PEERS", "NAME",
-        ]);
-
-        let vis = if s.public { "public" } else { "private" };
-
-        summary.add_row(vec![
-            region.clone(),
-            vis.into(),
-            s.cidrs.join(","),
-            vpc_id.clone(),
-            s.peers.join(","),
-            s.name.clone().unwrap_or_default(),
-        ]);
-
+        summary.set_header(summary_headers());
+        summary.add_row(summary_row(region, vpc_id, s));
         println!("{summary}");
-
-        /* ── resources table ───────────────────────────────────────────── */
         if !s.resources.is_empty() {
             let mut detail = Table::new();
             detail.load_preset(ASCII_FULL_CONDENSED);
             detail.set_header(vec!["TYPE", "NAME", "IDENTIFIER / ARN"]);
-
             for r in &s.resources {
-                detail.add_row(vec![
-                    r.rtype.to_owned(),
-                    r.name.clone(),
-                    r.arn.clone(),
-                ]);
+                detail.add_row(vec![r.rtype.to_owned(), r.name.clone(), r.arn.clone()]);
             }
             println!("{detail}");
         }
-
-        println!(); // blank line between VPC blocks
+        println!();
     }
 }
-
-/*──────── main ─────*/
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -306,11 +290,9 @@ async fn main() -> Result<()> {
         .filter_level(log::LevelFilter::Trace)
         .init();
 
-    /* scanners */
     let scanners: Vec<Box<dyn ServiceScanner>> =
         vec![Box::new(Ec2Scanner), Box::new(ElbScanner), Box::new(RdsScanner)];
 
-    /* collect data */
     let mut vpcs: BTreeMap<(String, String), VpcSummary> = BTreeMap::new();
     let start = Instant::now();
 
@@ -342,7 +324,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    /* output */
     if summary_only {
         print_summary_table(&vpcs);
     } else {
