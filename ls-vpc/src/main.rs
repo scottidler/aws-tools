@@ -24,7 +24,7 @@ use clap::{Parser, ValueHint};
 use comfy_table::Table;
 use comfy_table::presets::{ASCII_FULL, ASCII_FULL_CONDENSED};
 use env_logger::Target;
-use eyre::{eyre, Result};
+use eyre::Result;
 use log::trace;
 
 use aws_sdk_docdb::error::ProvideErrorMetadata;
@@ -44,8 +44,23 @@ struct VpcSummary {
 #[derive(Parser, Debug)]
 #[command(name = "ls-vpc", author, version, about)]
 struct Opt {
-    /// Comma-separated AWS regions, e.g. `us-west-2,us-east-1`
-    #[clap(long, value_delimiter = ',', num_args = 1..)]
+    /// AWS Regions to query (pick one or both of `us-east-1`, `us-west-2`).
+    ///
+    /// Examples:
+    ///   ls-vpc                    # uses the default us-east-1 us-west-2
+    ///   ls-vpc -r us-east-1       # east only
+    ///   ls-vpc -r us-west-2       # west only
+    ///   ls-vpc -r us-east-1 -r us-west-2   # both
+    #[clap(
+        short = 'r',
+        long = "regions",
+        value_parser = clap::builder::PossibleValuesParser::new(["us-east-1", "us-west-2"]),
+        num_args = 0..,
+        default_values_t = vec![
+            "us-east-1".to_string(),
+            "us-west-2".to_string()
+        ]
+    )]
     regions: Vec<String>,
 
     /// Optional VPC IDs. If omitted → summary mode.
@@ -271,9 +286,6 @@ fn print_detail_table(vpcs: &BTreeMap<(String, String), VpcSummary>) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt = Opt::parse();
-    if opt.regions.is_empty() {
-        return Err(eyre!("--regions is required"));
-    }
     let summary_only = opt.vpc_ids.is_empty();
 
     /* logging */
