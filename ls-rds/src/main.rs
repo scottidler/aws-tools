@@ -24,6 +24,7 @@ use std::{
 };
 
 #[derive(Parser, Debug)]
+#[command(name = "ls-rds", author, version = env!("GIT_DESCRIBE"), about)]
 struct Opt {
     /// Enumerate *all* accounts via AWS Organizations
     #[clap(long)]

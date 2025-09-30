@@ -30,7 +30,7 @@ use log::trace;
 use aws_sdk_docdb::error::ProvideErrorMetadata;
 
 #[derive(Parser, Debug)]
-#[command(name = "ls-vpc", author, version, about)]
+#[command(name = "ls-vpc", author, version = env!("GIT_DESCRIBE"), about)]
 struct Opt {
     /// AWS Regions to query (pick one or both of `us-east-1`, `us-west-2`).
     ///
