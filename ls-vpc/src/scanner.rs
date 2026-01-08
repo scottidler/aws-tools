@@ -13,7 +13,7 @@ use aws_types::SdkConfig;
 use eyre::Result;
 
 /// A single AWS resource that lives inside a VPC (instance, ENI, DB cluster…).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResourceRecord {
     pub arn:  String,
     pub rtype: &'static str,
