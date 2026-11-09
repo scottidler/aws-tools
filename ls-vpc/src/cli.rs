@@ -6,7 +6,7 @@
 use clap::{Parser, ValueHint};
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "ls-vpc", author, version = env!("GIT_DESCRIBE"), about)]
+#[command(name = "ls-vpc", author, version = env!("BUILD_VERSION"), about)]
 pub struct Cli {
     /// AWS Regions to query (pick one or both of `us-east-1`, `us-west-2`).
     ///

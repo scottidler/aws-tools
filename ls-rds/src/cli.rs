@@ -6,7 +6,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "ls-rds", author, version = env!("GIT_DESCRIBE"), about)]
+#[command(name = "ls-rds", author, version = env!("BUILD_VERSION"), about)]
 pub struct Cli {
     /// Enumerate *all* accounts via AWS Organizations
     #[clap(long)]
