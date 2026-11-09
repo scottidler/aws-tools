@@ -9,12 +9,12 @@ pub mod config;
 pub use cli::Cli;
 pub use config::{Config, ScanMode, extract_account_from_arn};
 
-use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_config::sts::AssumeRoleProvider;
+use aws_config::{BehaviorVersion, meta::region::RegionProviderChain};
 use aws_sdk_organizations as org;
 use aws_sdk_rds as rds;
 use aws_sdk_sts as sts;
-use aws_types::{region::Region, SdkConfig};
+use aws_types::{SdkConfig, region::Region};
 use eyre::Result;
 use log::{debug, error, info};
 use std::{env, fs, path::PathBuf};
@@ -63,7 +63,13 @@ pub fn get_or_create_log_dir() -> PathBuf {
 pub fn get_default_region(config: &Config) -> String {
     env::var("AWS_REGION")
         .or_else(|_| env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| config.regions.first().cloned().unwrap_or_else(|| "us-east-1".to_string()))
+        .unwrap_or_else(|_| {
+            config
+                .regions
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "us-east-1".to_string())
+        })
 }
 
 /// Get the caller's account ID
@@ -121,11 +127,7 @@ pub async fn list_rds(base_conf: &SdkConfig, regions: &[Region]) -> Result<Vec<R
 }
 
 /// Scan account via assumed role
-pub async fn scan_account(
-    base_conf: &SdkConfig,
-    regions: &[Region],
-    role_arn: &str,
-) -> Result<Vec<RdsInstance>> {
+pub async fn scan_account(base_conf: &SdkConfig, regions: &[Region], role_arn: &str) -> Result<Vec<RdsInstance>> {
     info!("--- Scanning with role {}", role_arn);
     let mut instances = Vec::new();
 
@@ -217,7 +219,7 @@ pub async fn process_role_arns(
 /// Run the RDS scan for given config
 pub async fn run(config: &Config) -> Result<ScanResult> {
     let default_region = get_default_region(config);
-    debug!("Bootstrap/STS Region: {}", &default_region);
+    debug!("Bootstrap/STS Region: {}", default_region);
 
     info!("Loading base AWS config…");
     let base_conf = aws_config::defaults(BehaviorVersion::latest())
@@ -237,12 +239,8 @@ pub async fn run(config: &Config) -> Result<ScanResult> {
         .collect();
 
     let instances = match &config.mode {
-        ScanMode::Organization => {
-            enumerate_organization(&base_conf, &regions).await?
-        }
-        ScanMode::RoleArns(arns) => {
-            process_role_arns(&base_conf, &regions, &caller_account, arns).await?
-        }
+        ScanMode::Organization => enumerate_organization(&base_conf, &regions).await?,
+        ScanMode::RoleArns(arns) => process_role_arns(&base_conf, &regions, &caller_account, arns).await?,
         ScanMode::CurrentAccount => {
             info!("Listing RDS in current account {}", caller_account);
             list_rds(&base_conf, &regions).await?

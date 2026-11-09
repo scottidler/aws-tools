@@ -15,11 +15,12 @@ use eyre::Result;
 /// A single AWS resource that lives inside a VPC (instance, ENI, DB cluster…).
 #[derive(Debug, Clone)]
 pub struct ResourceRecord {
-    pub arn:  String,
+    pub arn: String,
     pub rtype: &'static str,
     pub name: String,
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ServiceScanner: Send + Sync {
     async fn scan(&self, sdk: &SdkConfig, vpc_id: &str) -> Result<Vec<ResourceRecord>>;
@@ -35,12 +36,7 @@ impl ServiceScanner for Ec2Scanner {
 
         let mut pages = client
             .describe_instances()
-            .filters(
-                ec2::types::Filter::builder()
-                    .name("vpc-id")
-                    .values(vpc_id)
-                    .build(),
-            )
+            .filters(ec2::types::Filter::builder().name("vpc-id").values(vpc_id).build())
             .into_paginator()
             .items()
             .send();
@@ -62,12 +58,7 @@ impl ServiceScanner for Ec2Scanner {
 
         for eni in client
             .describe_network_interfaces()
-            .filters(
-                ec2::types::Filter::builder()
-                    .name("vpc-id")
-                    .values(vpc_id)
-                    .build(),
-            )
+            .filters(ec2::types::Filter::builder().name("vpc-id").values(vpc_id).build())
             .send()
             .await?
             .network_interfaces()
@@ -81,12 +72,7 @@ impl ServiceScanner for Ec2Scanner {
 
         for ngw in client
             .describe_nat_gateways()
-            .filter(
-                ec2::types::Filter::builder()
-                    .name("vpc-id")
-                    .values(vpc_id)
-                    .build(),
-            )
+            .filter(ec2::types::Filter::builder().name("vpc-id").values(vpc_id).build())
             .send()
             .await?
             .nat_gateways()
@@ -100,12 +86,7 @@ impl ServiceScanner for Ec2Scanner {
 
         for fl in client
             .describe_flow_logs()
-            .filter(
-                ec2::types::Filter::builder()
-                    .name("resource-id")
-                    .values(vpc_id)
-                    .build(),
-            )
+            .filter(ec2::types::Filter::builder().name("resource-id").values(vpc_id).build())
             .send()
             .await?
             .flow_logs()
@@ -162,11 +143,7 @@ impl ServiceScanner for RdsScanner {
         let mut recs = Vec::new();
 
         for db in client.describe_db_instances().send().await?.db_instances() {
-            if db
-                .db_subnet_group()
-                .and_then(|g| g.vpc_id())
-                == Some(vpc_id)
-            {
+            if db.db_subnet_group().and_then(|g| g.vpc_id()) == Some(vpc_id) {
                 recs.push(ResourceRecord {
                     arn: db.db_instance_arn().unwrap_or_default().to_owned(),
                     rtype: "rds.instance",

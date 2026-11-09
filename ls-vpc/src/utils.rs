@@ -3,7 +3,7 @@
 //! Helper utilities that don’t fit anywhere else.
 
 use std::{env, fs, path::PathBuf};
-use terminal_size::{terminal_size, Width};
+use terminal_size::{Width, terminal_size};
 
 /// Return (and create if needed) a platform-appropriate directory for log files.
 pub fn get_or_create_log_dir() -> PathBuf {
@@ -27,9 +27,7 @@ pub fn get_or_create_log_dir() -> PathBuf {
 
 /// Best-effort detection of the current terminal width (columns).
 pub fn terminal_width() -> usize {
-    terminal_size()
-        .map(|(Width(w), _)| w as usize)
-        .unwrap_or(80)
+    terminal_size().map(|(Width(w), _)| w as usize).unwrap_or(80)
 }
 
 /// Wrap a long AWS identifier (ARN, ENI-id …) so that every rendered line
@@ -54,8 +52,8 @@ pub fn wrap_identifier(ident: &str, max_width: usize) -> String {
     let delim = if ident.contains('/') { '/' } else { ':' };
     let segments: Vec<&str> = ident.split(delim).collect();
 
-    let mut lines:   Vec<String> = Vec::new();
-    let mut current: String      = String::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut current: String = String::new();
 
     for seg in segments.iter() {
         // Length we’d add if we append this segment (+1 for delim when needed).
@@ -68,7 +66,7 @@ pub fn wrap_identifier(ident: &str, max_width: usize) -> String {
 
             // Start a new indented line for the segment we couldn’t fit.
             current.clear();
-            current.push_str("  ");         // two-space indent
+            current.push_str("  "); // two-space indent
             current.push_str(seg);
         } else {
             if !current.is_empty() {
@@ -144,7 +142,11 @@ mod tests {
         let lines: Vec<&str> = result.lines().collect();
         // All continuation lines should start with two spaces
         for line in lines.iter().skip(1) {
-            assert!(line.starts_with("  "), "Continuation line should start with two spaces: {}", line);
+            assert!(
+                line.starts_with("  "),
+                "Continuation line should start with two spaces: {}",
+                line
+            );
         }
     }
 

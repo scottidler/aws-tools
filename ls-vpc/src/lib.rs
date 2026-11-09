@@ -16,9 +16,9 @@ pub use utils::{get_or_create_log_dir, terminal_width, wrap_identifier};
 use aws_config::BehaviorVersion;
 use aws_sdk_docdb::error::ProvideErrorMetadata;
 use aws_sdk_ec2 as ec2;
-use aws_types::{region::Region, SdkConfig};
-use comfy_table::presets::{ASCII_FULL, ASCII_FULL_CONDENSED};
+use aws_types::{SdkConfig, region::Region};
 use comfy_table::Table;
+use comfy_table::presets::{ASCII_FULL, ASCII_FULL_CONDENSED};
 use eyre::Result;
 use log::trace;
 use std::collections::BTreeMap;
@@ -59,10 +59,7 @@ pub fn summary_row(region: &str, vpc_id: &str, s: &VpcSummary) -> Vec<String> {
 }
 
 /// List VPCs, optionally filtered by ID
-pub async fn list_filtered_vpcs(
-    client: &ec2::Client,
-    filter: &[String],
-) -> Result<Vec<(String, Option<String>)>> {
+pub async fn list_filtered_vpcs(client: &ec2::Client, filter: &[String]) -> Result<Vec<(String, Option<String>)>> {
     let mut out = Vec::new();
     for id in filter {
         match client.describe_vpcs().vpc_ids(id).send().await {
@@ -146,21 +143,16 @@ where
 
     let resp = client
         .describe_vpc_peering_connections()
-        .filters(
-            ec2::types::Filter::builder()
-                .name(filter_name)
-                .values(vpc_id)
-                .build(),
-        )
+        .filters(ec2::types::Filter::builder().name(filter_name).values(vpc_id).build())
         .send()
         .await?;
 
     let mut peers = Vec::new();
     for pc in resp.vpc_peering_connections() {
-        if matches!(pc.status().and_then(|s| s.code()), Some(State::Active)) {
-            if let Some(pid) = extract_other(pc) {
-                peers.push(pid.to_owned());
-            }
+        if matches!(pc.status().and_then(|s| s.code()), Some(State::Active))
+            && let Some(pid) = extract_other(pc)
+        {
+            peers.push(pid.to_owned());
         }
     }
     Ok(peers)
@@ -170,21 +162,15 @@ where
 pub async fn get_peer_vpcs(conf: &SdkConfig, vpc_id: &str) -> Result<Vec<String>> {
     let client = ec2::Client::new(conf);
 
-    let mut peers = collect_peers(
-        &client,
-        vpc_id,
-        "requester-vpc-info.vpc-id",
-        |pc| pc.accepter_vpc_info().and_then(|i| i.vpc_id()),
-    )
+    let mut peers = collect_peers(&client, vpc_id, "requester-vpc-info.vpc-id", |pc| {
+        pc.accepter_vpc_info().and_then(|i| i.vpc_id())
+    })
     .await?;
 
     peers.extend(
-        collect_peers(
-            &client,
-            vpc_id,
-            "accepter-vpc-info.vpc-id",
-            |pc| pc.requester_vpc_info().and_then(|i| i.vpc_id()),
-        )
+        collect_peers(&client, vpc_id, "accepter-vpc-info.vpc-id", |pc| {
+            pc.requester_vpc_info().and_then(|i| i.vpc_id())
+        })
         .await?,
     );
 
@@ -251,13 +237,7 @@ pub fn format_detail_table(vpcs: &BTreeMap<(String, String), VpcSummary>) -> Str
         output.push('\n');
 
         if !s.resources.is_empty() {
-            let type_col_len = s
-                .resources
-                .iter()
-                .map(|r| r.rtype.len())
-                .max()
-                .unwrap_or(4)
-                .min(25);
+            let type_col_len = s.resources.iter().map(|r| r.rtype.len()).max().unwrap_or(4).min(25);
 
             let name_col_len = s
                 .resources
@@ -279,23 +259,17 @@ pub fn format_detail_table(vpcs: &BTreeMap<(String, String), VpcSummary>) -> Str
             detail
                 .column_mut(0)
                 .expect("TYPE column exists")
-                .set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(
-                    type_col_len as u16,
-                )));
+                .set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(type_col_len as u16)));
 
             detail
                 .column_mut(1)
                 .expect("NAME column exists")
-                .set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(
-                    name_col_len as u16,
-                )));
+                .set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(name_col_len as u16)));
 
             detail
                 .column_mut(2)
                 .expect("ARN column exists")
-                .set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(
-                    arn_col_len as u16,
-                )));
+                .set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(arn_col_len as u16)));
 
             for r in &s.resources {
                 detail.add_row(vec![
@@ -316,8 +290,7 @@ pub fn format_detail_table(vpcs: &BTreeMap<(String, String), VpcSummary>) -> Str
 
 /// Run the VPC scan for given config
 pub async fn run(config: &Config) -> Result<ScanResult> {
-    let scanners: Vec<Box<dyn ServiceScanner>> =
-        vec![Box::new(Ec2Scanner), Box::new(ElbScanner), Box::new(RdsScanner)];
+    let scanners: Vec<Box<dyn ServiceScanner>> = vec![Box::new(Ec2Scanner), Box::new(ElbScanner), Box::new(RdsScanner)];
 
     let mut vpcs: BTreeMap<(String, String), VpcSummary> = BTreeMap::new();
 

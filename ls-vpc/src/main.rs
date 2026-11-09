@@ -8,7 +8,7 @@
 use clap::Parser;
 use env_logger::Target;
 use eyre::Result;
-use ls_vpc::{format_detail_table, format_summary_table, get_or_create_log_dir, run, Cli, Config};
+use ls_vpc::{Cli, Config, format_detail_table, format_summary_table, get_or_create_log_dir, run};
 use std::{fs::OpenOptions, io::Write, time::Instant};
 
 #[tokio::main]
@@ -18,10 +18,7 @@ async fn main() -> Result<()> {
 
     // Set up logging
     let log_file = get_or_create_log_dir().join("ls-vpc.log");
-    let fh = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file)?;
+    let fh = OpenOptions::new().create(true).append(true).open(&log_file)?;
     env_logger::Builder::from_default_env()
         .target(Target::Pipe(Box::new(fh)))
         .format(|buf, rec| {

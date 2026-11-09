@@ -73,11 +73,7 @@ mod tests {
 
     #[test]
     fn cli_parses_role_arns() {
-        let cli = Cli::parse_from([
-            "ls-rds",
-            "--role-arns",
-            "arn:aws:iam::123456789012:role/TestRole",
-        ]);
+        let cli = Cli::parse_from(["ls-rds", "--role-arns", "arn:aws:iam::123456789012:role/TestRole"]);
         assert_eq!(cli.role_arns.len(), 1);
         assert!(cli.role_arns[0].contains("TestRole"));
     }
